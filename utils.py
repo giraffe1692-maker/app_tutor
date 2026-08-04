@@ -2,7 +2,8 @@
 """
 utils.py
 - LaTeX 구분자 변환: \\( \\) / \\[ \\] -> $ $ / $$ $$  (Streamlit markdown은 $ 구분자의 MathJax/KaTeX만 인식)
-- 문제 이미지(관리자 등록) / 첨부 이미지(학생 제출) 로컬 저장 헬퍼
+- 학생이 채팅/정답 제출 시 첨부하는 이미지의 임시 로컬 저장 헬퍼
+  (관리자용 "문제 이미지"는 drive_client.py를 통해 구글 드라이브에서 직접 가져옵니다)
 """
 
 import os
@@ -10,8 +11,7 @@ import re
 import base64
 import uuid
 
-PROBLEM_IMAGE_DIR = "problem_images"   # 관리자가 미리 넣어둔 문제 이미지 폴더 (앱과 함께 배포)
-UPLOAD_IMAGE_DIR = "uploads"           # 학생이 업로드한 이미지 저장 폴더 (세션 중 임시 저장)
+UPLOAD_IMAGE_DIR = "uploads"  # 학생이 업로드한 이미지 저장 폴더 (세션 중 임시 저장, AI 전달용)
 
 os.makedirs(UPLOAD_IMAGE_DIR, exist_ok=True)
 
@@ -24,14 +24,6 @@ def latex_for_markdown(text: str) -> str:
     s = re.sub(r"\\\[(.*?)\\\]", r"$$\1$$", s, flags=re.DOTALL)
     s = re.sub(r"\\\((.*?)\\\)", r"$\1$", s, flags=re.DOTALL)
     return s
-
-
-def find_problem_image_path(filename: str) -> str | None:
-    """problem_images/ 폴더에서 파일명으로 이미지 경로 탐색."""
-    if not filename:
-        return None
-    path = os.path.join(PROBLEM_IMAGE_DIR, str(filename).strip())
-    return path if os.path.exists(path) else None
 
 
 def save_uploaded_image(uploaded_file, prefix: str = "img") -> tuple[str, str]:
