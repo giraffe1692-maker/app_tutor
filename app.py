@@ -15,7 +15,8 @@ import streamlit as st
 
 from sheets_client import SheetsClient
 from groq_client import GroqClient
-from utils import latex_for_markdown, find_problem_image_path, save_uploaded_image, image_to_base64
+from drive_client import DriveClient
+from utils import latex_for_markdown, save_uploaded_image, image_to_base64
 
 st.set_page_config(page_title="물리 문제 힌트 제공 시스템", page_icon="🧲", layout="centered")
 
@@ -29,6 +30,15 @@ def get_sheets_client() -> SheetsClient:
     sheet_id = st.secrets["SHEET_ID"]
     sa_info = dict(st.secrets["gcp_service_account"])
     return SheetsClient(sheet_id=sheet_id, service_account_info=sa_info)
+
+
+@st.cache_resource(show_spinner=False)
+def get_drive_client() -> DriveClient:
+    sa_info = dict(st.secrets["gcp_service_account"])
+    return DriveClient(
+        service_account_info=sa_info,
+        folder_id=st.secrets["PROBLEM_IMAGE_FOLDER_ID"],
+    )
 
 
 @st.cache_resource(show_spinner=False)
@@ -64,10 +74,11 @@ init_state()
 
 try:
     sheets = get_sheets_client()
+    drive = get_drive_client()
     groq = get_groq_client()
 except Exception as e:  # noqa: BLE001
     st.error(
-        "설정 오류: 구글 시트 / Groq API 연결에 실패했습니다. "
+        "설정 오류: 구글 시트 / 드라이브 / Groq API 연결에 실패했습니다. "
         ".streamlit/secrets.toml 설정을 확인해주세요.\n\n" + str(e)
     )
     st.stop()
@@ -161,11 +172,13 @@ def render_survey():
 def render_problem_image(image_file: str):
     if not image_file:
         return
-    path = find_problem_image_path(image_file)
-    if path:
-        st.image(path, use_container_width=True)
+    result = drive.get_image_base64(image_file)
+    if result:
+        b64, mime = result
+        st.image(f"data:{mime};base64,{b64}", use_container_width=True)
     else:
-        st.warning(f"⚠ 이미지 파일({image_file})을 찾을 수 없습니다. `problem_images/` 폴더를 확인해주세요.")
+        st.warning(f"⚠ 드라이브 폴더에서 이미지 파일({image_file})을 찾을 수 없습니다. "
+                   "파일명이 시트와 정확히 일치하는지, 서비스 계정이 해당 폴더에 공유되어 있는지 확인해주세요.")
 
 
 # ---------------------------------------------------------------------------
@@ -301,11 +314,9 @@ def handle_answer_submit(problem, is_preview, selected_choice, free_text_answer,
                 + f"[채점 결과] {'정답' if correct else '오답'}"
             )
             content_arr = [{"type": "text", "text": user_text}]
-            prob_img = find_problem_image_path(problem.get("imageFile"))
-            if prob_img:
-                pair = image_to_base64(prob_img)
-                if pair:
-                    content_arr.append({"type": "image_url", "image_url": {"url": f"data:{pair[1]};base64,{pair[0]}"}})
+            pair = drive.get_image_base64(problem.get("imageFile"))
+            if pair:
+                content_arr.append({"type": "image_url", "image_url": {"url": f"data:{pair[1]};base64,{pair[0]}"}})
             if img_b64:
                 content_arr.append({"type": "image_url", "image_url": {"url": f"data:{img_mime};base64,{img_b64}"}})
 
@@ -520,18 +531,16 @@ def send_chat_message(user, level, problem_id, message, chat_img):
     with st.spinner("AI 선생님이 답변을 작성 중입니다..."):
         messages = [{"role": "system", "content": system_prompt}]
 
-        prob_img_path = find_problem_image_path(row[4]) if row is not None else None
-        if prob_img_path:
-            pair = image_to_base64(prob_img_path)
-            if pair:
-                messages.append({
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "[참고용 문제 이미지입니다]"},
-                        {"type": "image_url", "image_url": {"url": f"data:{pair[1]};base64,{pair[0]}"}},
-                    ],
-                })
-                messages.append({"role": "assistant", "content": "문제 이미지를 확인했습니다."})
+        pair = drive.get_image_base64(row[4]) if row is not None else None
+        if pair:
+            messages.append({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "[참고용 문제 이미지입니다]"},
+                    {"type": "image_url", "image_url": {"url": f"data:{pair[1]};base64,{pair[0]}"}},
+                ],
+            })
+            messages.append({"role": "assistant", "content": "문제 이미지를 확인했습니다."})
 
         history = sheets.get_chat_history(user["name"], user["studentId"], level, problem_id)
         active_history = history[:-1]  # 방금 저장한 user 메시지 제외
