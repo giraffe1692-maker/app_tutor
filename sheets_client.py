@@ -5,10 +5,24 @@ Google Sheets 연동 모듈 (9개 시트: 계정 / 문제_Lv0~3 / 설문(문항)
 
 원본 Apps Script(Code.gs)의 로직을 그대로 Python으로 이식했습니다.
 gspread + google-auth 서비스 계정 인증을 사용합니다.
+
+[안정성 개선]
+- Streamlit은 상호작용마다 스크립트를 처음부터 다시 실행하는데, 기존 코드는 같은 시트를
+  한 번의 재실행 안에서도 여러 번(get_group_progress -> get_chat_history 등) 중복해서 읽어와
+  구글 시트 API의 분당 읽기 한도(사용자당 분당 60회)를 쉽게 초과했습니다. 이것이
+  "This app has encountered an error... gspread.exceptions.APIError" 의 주된 원인입니다.
+- 아래 두 가지로 이를 완화합니다.
+  1) 짧은 TTL(기본 4초)의 인메모리 읽기 캐시: 같은 재실행 안에서 동일 시트를 반복 조회해도
+     실제 API 호출은 한 번만 나가도록 함. 쓰기(append/update) 발생 시 해당 시트 캐시는 즉시 무효화.
+  2) 429(rate limit) / 5xx / 순간 네트워크 오류에 대한 지수 백오프 재시도.
+     재시도를 다 소진하면 사용자에게 친절한 SheetsTemporaryError 로 감싸서 올립니다.
+     app.py 에서 이 예외를 잡아 "잠시 후 다시 시도해주세요" 형태로 보여줍니다.
 """
 
 from __future__ import annotations
 import datetime as dt
+import functools
+import time
 from typing import Optional
 
 import gspread
@@ -26,26 +40,99 @@ COL_ANSWER_IDX, COL_HINT, COL_ACTIVE = 10, 11, 12
 
 MIN_LEVEL, MAX_LEVEL = 0, 3
 
+# 대화내역에 자동으로 기록되는 "총평(리뷰)" 메시지의 접두어. 중복 생성을 막는 데 사용.
+REVIEW_PREFIX = "📊 [단원 총평]"
+
 
 def _now_str() -> str:
     return dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+class SheetsTemporaryError(Exception):
+    """구글 시트 API 호출이 재시도 후에도 계속 실패할 때 발생. app.py에서 사용자 친화적으로 처리."""
+
+
+def _with_retry(max_retries: int = 4, base_delay: float = 0.7):
+    """구글 시트 API의 일시적 오류(429 rate limit, 5xx, 네트워크 오류)에 대해 지수 백오프로 재시도."""
+
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            last_exc = None
+            for attempt in range(max_retries):
+                try:
+                    return fn(*args, **kwargs)
+                except gspread.exceptions.APIError as e:
+                    last_exc = e
+                    status = None
+                    try:
+                        status = e.response.status_code
+                    except Exception:  # noqa: BLE001
+                        pass
+                    # 명확히 영구적인 오류(예: 403 권한 없음, 404 시트 없음)는 즉시 올림.
+                    if status in (400, 401, 403, 404):
+                        raise
+                    # 429(속도 제한), 5xx, 혹은 원인이 불명확(redacted)한 오류는 재시도.
+                    if attempt < max_retries - 1:
+                        time.sleep(base_delay * (2 ** attempt))
+                        continue
+                    raise SheetsTemporaryError(
+                        "구글 시트 요청이 반복적으로 실패했습니다 (아마도 짧은 시간에 너무 많은 요청이 "
+                        "몰렸을 가능성이 높습니다). 잠시 후 다시 시도해주세요."
+                    ) from e
+                except (ConnectionError, TimeoutError) as e:
+                    last_exc = e
+                    if attempt < max_retries - 1:
+                        time.sleep(base_delay * (2 ** attempt))
+                        continue
+                    raise SheetsTemporaryError(
+                        "네트워크 연결이 불안정하여 구글 시트 요청에 실패했습니다. 잠시 후 다시 시도해주세요."
+                    ) from e
+            raise SheetsTemporaryError(str(last_exc))
+
+        return wrapper
+
+    return decorator
+
+
 class SheetsClient:
+    # 같은 재실행(rerun) 안에서 동일 시트를 반복 조회할 때 실제 API 호출을 줄이기 위한 TTL(초)
+    _CACHE_TTL = 4.0
+
     def __init__(self, sheet_id: str, service_account_info: dict):
         creds = Credentials.from_service_account_info(service_account_info, scopes=SCOPES)
         self.gc = gspread.authorize(creds)
         self.sheet_id = sheet_id
         self._sh = self.gc.open_by_key(sheet_id)
         self._ws_cache = {}
+        self._read_cache: dict[str, tuple[float, list[list]]] = {}
 
     # ---------------------------------------------------------------
-    # 내부 유틸
+    # 내부 유틸 (재시도 래퍼 + 캐시)
     # ---------------------------------------------------------------
     def ws(self, name: str):
         if name not in self._ws_cache:
             self._ws_cache[name] = self._sh.worksheet(name)
         return self._ws_cache[name]
+
+    @_with_retry()
+    def _api_get_all_values(self, worksheet):
+        return worksheet.get_all_values()
+
+    @_with_retry()
+    def _api_update_cell(self, worksheet, row, col, value):
+        return worksheet.update_cell(row, col, value)
+
+    @_with_retry()
+    def _api_append_row(self, worksheet, row):
+        return worksheet.append_row(row)
+
+    @_with_retry()
+    def _api_append_rows(self, worksheet, rows):
+        return worksheet.append_rows(rows)
+
+    def _invalidate_cache(self, sheet_name: str):
+        self._read_cache.pop(sheet_name, None)
 
     @staticmethod
     def compute_problem_id(row: list) -> str:
@@ -74,17 +161,26 @@ class SheetsClient:
                 choices.append({"index": i + 1, "text": str(row[c])})
         return choices
 
-    def _get_all_rows(self, sheet_name: str) -> list[list]:
-        """헤더를 제외한 전체 데이터 행 (빈 셀도 패딩)"""
-        values = self.ws(sheet_name).get_all_values()
+    def _get_all_rows(self, sheet_name: str, use_cache: bool = True) -> list[list]:
+        """헤더를 제외한 전체 데이터 행 (빈 셀도 패딩). 짧은 TTL 동안 재조회 시 캐시 사용."""
+        now = time.monotonic()
+        if use_cache:
+            cached = self._read_cache.get(sheet_name)
+            if cached and (now - cached[0]) < self._CACHE_TTL:
+                return cached[1]
+
+        values = self._api_get_all_values(self.ws(sheet_name))
         if not values:
-            return []
-        header_len = len(values[0])
-        rows = []
-        for r in values[1:]:
-            if len(r) < header_len:
-                r = r + [""] * (header_len - len(r))
-            rows.append(r)
+            rows: list[list] = []
+        else:
+            header_len = len(values[0])
+            rows = []
+            for r in values[1:]:
+                if len(r) < header_len:
+                    r = r + [""] * (header_len - len(r))
+                rows.append(r)
+
+        self._read_cache[sheet_name] = (now, rows)
         return rows
 
     # ---------------------------------------------------------------
@@ -98,7 +194,8 @@ class SheetsClient:
 
         for i, r in enumerate(rows):
             if str(r[0]).strip() == name and str(r[1]).strip() == student_id:
-                sheet.update_cell(i + 2, 4, now)  # 최근접속일시
+                self._api_update_cell(sheet, i + 2, 4, now)  # 최근접속일시
+                self._invalidate_cache("계정")
                 return {
                     "isNew": False,
                     "name": name,
@@ -107,7 +204,8 @@ class SheetsClient:
                     "surveyDone": str(r[5]).strip() == "Y",
                 }
 
-        sheet.append_row([name, student_id, now, now, "", "N", ""])
+        self._api_append_row(sheet, [name, student_id, now, now, "", "N", ""])
+        self._invalidate_cache("계정")
         return {"isNew": True, "name": name, "studentId": student_id, "level": "", "surveyDone": False}
 
     # ---------------------------------------------------------------
@@ -133,7 +231,8 @@ class SheetsClient:
             rows_to_append.append([name, student_id, a["num"], a["score"], now])
             total += float(a["score"])
         if rows_to_append:
-            record_sheet.append_rows(rows_to_append)
+            self._api_append_rows(record_sheet, rows_to_append)
+            self._invalidate_cache("설문(기록)")
         avg = total / len(answers) if answers else 0
 
         crit_rows = self._get_all_rows("설문(기준)")
@@ -148,8 +247,9 @@ class SheetsClient:
         acc_rows = self._get_all_rows("계정")
         for i, r in enumerate(acc_rows):
             if str(r[0]).strip() == name and str(r[1]).strip() == student_id:
-                acc_sheet.update_cell(i + 2, 5, level)
-                acc_sheet.update_cell(i + 2, 6, "Y")
+                self._api_update_cell(acc_sheet, i + 2, 5, level)
+                self._api_update_cell(acc_sheet, i + 2, 6, "Y")
+                self._invalidate_cache("계정")
                 break
 
         return {"level": level, "avg": avg}
@@ -216,36 +316,13 @@ class SheetsClient:
             for r in matched
         ]
 
-    def get_solved_sub_labels(self, name, student_id, level, group_id) -> set:
-        history = self.get_chat_history(name, student_id, level)
-        solved = set()
-        for h in history:
-            if h["role"] != "assistant" or str(h.get("level")) != str(level):
-                continue
-            if not str(h["message"]).startswith("✅"):
-                continue
-            gid, sub = self.parse_problem_id(h.get("problemId"))
-            if gid == str(group_id):
-                solved.add(sub)
-        return solved
-
-    def get_attempted_sub_labels(self, name, student_id, level, group_id) -> set:
-        history = self.get_chat_history(name, student_id, level)
-        attempted = set()
-        for h in history:
-            if h["role"] != "assistant" or str(h.get("level")) != str(level):
-                continue
-            msg = str(h["message"])
-            if not (msg.startswith("✅") or msg.startswith("❌")):
-                continue
-            gid, sub = self.parse_problem_id(h.get("problemId"))
-            if gid == str(group_id):
-                attempted.add(sub)
-        return attempted
-
+    # ---------------------------------------------------------------
+    # 소문항 시도/정답 여부 (대화내역을 한 번만 읽어 재사용)
+    # ---------------------------------------------------------------
     def get_group_attempts(self, name, student_id, level, group_id) -> dict:
+        """group_id 안의 각 소문항(subLabel) -> 마지막 채점 결과(True=정답/False=오답). 시도 안 했으면 키 없음."""
         history = self.get_chat_history(name, student_id, level)
-        attempts = {}
+        attempts: dict[str, bool] = {}
         for h in history:
             if h["role"] != "assistant" or str(h.get("level")) != str(level):
                 continue
@@ -255,17 +332,26 @@ class SheetsClient:
             if not (is_correct or is_incorrect):
                 continue
             gid, sub = self.parse_problem_id(h.get("problemId"))
-            if gid == str(group_id) and sub not in attempts:
-                attempts[sub] = is_correct
+            if gid == str(group_id):
+                attempts[sub] = is_correct  # 마지막 시도 결과로 갱신
         return attempts
+
+    def get_solved_sub_labels(self, name, student_id, level, group_id) -> set:
+        attempts = self.get_group_attempts(name, student_id, level, group_id)
+        return {sub for sub, ok in attempts.items() if ok}
+
+    def get_attempted_sub_labels(self, name, student_id, level, group_id) -> set:
+        attempts = self.get_group_attempts(name, student_id, level, group_id)
+        return set(attempts.keys())
 
     def get_group_progress(self, name, student_id, level, group_id) -> dict:
         siblings = self.get_group_siblings(level, group_id)
         if len(siblings) <= 1:
             return {"siblings": siblings, "solvedSubLabels": [], "unlockedSiblings": siblings, "groupComplete": True}
 
-        attempted = self.get_attempted_sub_labels(name, student_id, level, group_id)
-        solved = self.get_solved_sub_labels(name, student_id, level, group_id)
+        attempts = self.get_group_attempts(name, student_id, level, group_id)
+        attempted = set(attempts.keys())
+        solved = {sub for sub, ok in attempts.items() if ok}
 
         consecutive = 0
         for s in siblings:
@@ -281,6 +367,16 @@ class SheetsClient:
             "unlockedSiblings": siblings[:unlocked_count],
             "groupComplete": consecutive == len(siblings),
         }
+
+    def get_next_sibling(self, level, group_id, current_sub_label: str) -> Optional[dict]:
+        """현재 소문항 바로 다음 소문항 정보를 반환 (없으면 None)."""
+        siblings = self.get_group_siblings(level, group_id)
+        for i, s in enumerate(siblings):
+            if s["subLabel"] == str(current_sub_label):
+                if i + 1 < len(siblings):
+                    return siblings[i + 1]
+                return None
+        return None
 
     def build_problem_payload(self, row, level, name=None, student_id=None) -> Optional[dict]:
         if row is None:
@@ -332,7 +428,8 @@ class SheetsClient:
                     row = self.get_problem_row(level)
                     if row is not None:
                         cur_id = self.compute_problem_id(row)
-                        sheet.update_cell(i + 2, 7, cur_id)
+                        self._api_update_cell(sheet, i + 2, 7, cur_id)
+                        self._invalidate_cache("계정")
                 return {"level": level, "problem": self.build_problem_payload(row, level, name, student_id)}
         raise ValueError("계정을 찾을 수 없습니다.")
 
@@ -352,13 +449,7 @@ class SheetsClient:
         if not any(s["subLabel"] == target_sub for s in progress["unlockedSiblings"]):
             raise ValueError("아직 풀 수 없는 소문항입니다. 이전 소문항을 먼저 해결해주세요.")
 
-        sheet = self.ws("계정")
-        rows = self._get_all_rows("계정")
-        for i, r in enumerate(rows):
-            if str(r[0]).strip() == name and str(r[1]).strip() == student_id:
-                sheet.update_cell(i + 2, 7, self.compute_problem_id(row))
-                break
-
+        self.update_current_problem_id(name, student_id, self.compute_problem_id(row))
         return self.build_problem_payload(row, level, name, student_id)
 
     # ---------------------------------------------------------------
@@ -373,12 +464,14 @@ class SheetsClient:
 
         if problem_id not in (None, ""):
             target_gid, _ = self.parse_problem_id(problem_id)
+
             def _match(r):
                 rpid = str(r[7]).strip()
                 if rpid == str(problem_id).strip():
                     return True
                 rgid, _ = self.parse_problem_id(rpid)
                 return bool(rgid) and rgid == target_gid
+
             filtered = [r for r in filtered if _match(r)]
 
         def _seq(r):
@@ -404,9 +497,11 @@ class SheetsClient:
         return int(max(float(r[2]) for r in mine)) + 1
 
     def append_chat(self, name, student_id, seq, role, message, image_file, problem_id, level):
-        self.ws("대화내역").append_row(
-            [name, student_id, seq, role, message, image_file or "", _now_str(), problem_id or "", level or ""]
+        self._api_append_row(
+            self.ws("대화내역"),
+            [name, student_id, seq, role, message, image_file or "", _now_str(), problem_id or "", level or ""],
         )
+        self._invalidate_cache("대화내역")
 
     def get_problem_history(self, name, student_id) -> list[dict]:
         name, student_id = name.strip(), student_id.strip()
@@ -428,6 +523,26 @@ class SheetsClient:
         return result
 
     # ---------------------------------------------------------------
+    # 5-2. 단원(그룹) 총평 - 중복 생성 방지
+    # ---------------------------------------------------------------
+    def has_group_review(self, name, student_id, level, group_id) -> bool:
+        """해당 소문항 그룹에 대한 총평이 이미 대화내역에 기록되어 있는지 확인."""
+        history = self.get_chat_history(name, student_id, level)
+        for h in history:
+            if h["role"] != "assistant":
+                continue
+            if not str(h["message"]).startswith(REVIEW_PREFIX):
+                continue
+            gid, _ = self.parse_problem_id(h.get("problemId"))
+            if gid == str(group_id):
+                return True
+        return False
+
+    def append_group_review(self, name, student_id, level, group_id, review_text):
+        seq = self._get_next_seq(name, student_id)
+        self.append_chat(name, student_id, seq, "assistant", f"{REVIEW_PREFIX} {review_text}", "", group_id, level)
+
+    # ---------------------------------------------------------------
     # 6. 레벨 갱신
     # ---------------------------------------------------------------
     def update_account_level(self, name, student_id, new_level):
@@ -435,7 +550,8 @@ class SheetsClient:
         rows = self._get_all_rows("계정")
         for i, r in enumerate(rows):
             if str(r[0]).strip() == name and str(r[1]).strip() == str(student_id):
-                sheet.update_cell(i + 2, 5, str(new_level))
+                self._api_update_cell(sheet, i + 2, 5, str(new_level))
+                self._invalidate_cache("계정")
                 break
 
     def update_current_problem_id(self, name, student_id, problem_id):
@@ -443,7 +559,8 @@ class SheetsClient:
         rows = self._get_all_rows("계정")
         for i, r in enumerate(rows):
             if str(r[0]).strip() == name and str(r[1]).strip() == str(student_id):
-                sheet.update_cell(i + 2, 7, problem_id)
+                self._api_update_cell(sheet, i + 2, 7, problem_id)
+                self._invalidate_cache("계정")
                 break
 
     @staticmethod
