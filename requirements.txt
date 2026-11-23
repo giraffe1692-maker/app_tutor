@@ -3,3 +3,4 @@ gspread>=6.1
 google-auth>=2.32
 google-api-python-client>=2.140
 requests>=2.32
+openpyxl
